@@ -3,6 +3,7 @@ use std::time::Duration;
 use shell_escape::unix::escape;
 use tokio::time::{self, timeout};
 
+use crate::guard::{self, Outcome};
 use crate::herdr::{
     AgentInfo, PanePiStatus, focus_pane, get_agent_list, get_pane_process_info,
     is_pi_running_in_pane, original_pane, run_in_pane,
@@ -12,6 +13,7 @@ use crate::progress::Progress;
 #[derive(Debug, PartialEq)]
 pub struct ReloadSummary {
     pub(crate) reloaded: usize,
+    pub(crate) skipped_drafts: usize,
     pub(crate) skipped_non_pi: usize,
     pub(crate) skipped_unsafe_status: usize,
     pub(crate) skipped_invalid_agent_data: usize,
@@ -23,6 +25,7 @@ pub struct ReloadSummary {
 pub struct ResetSummary {
     pub(crate) reset: usize,
     pub(crate) visited: usize,
+    pub(crate) skipped_drafts: usize,
     pub(crate) skipped_non_pi: usize,
     pub(crate) skipped_unsafe_status: usize,
     pub(crate) failed: usize,
@@ -162,7 +165,7 @@ async fn wait_until_pi_exits(herdr_path: &str, pane_id: &str) -> Result<(), Stri
         }
     })
     .await
-    .map_err(|_| format!("{pane_id}: shell not ready after /quit; no start command sent"))?
+    .map_err(|_| format!("{pane_id}: shell not ready after shutdown; no start command sent"))?
 }
 
 async fn wait_until_pi_ready(herdr_path: &str, candidate: &ResetCandidate) -> Result<(), String> {
@@ -193,12 +196,16 @@ async fn wait_until_pi_ready(herdr_path: &str, candidate: &ResetCandidate) -> Re
 async fn reset_one_candidate(
     herdr_path: &str,
     candidate: &ResetCandidate,
+    agent: &AgentInfo,
     progress: &Progress,
     completed: usize,
     total: usize,
-) -> Result<(), String> {
+) -> Result<Outcome, String> {
     progress.update(completed, total, &format!("{} stopping", candidate.pane_id))?;
-    run_in_pane(herdr_path, &candidate.pane_id, "/quit").await?;
+    let outcome = guard::control(herdr_path, agent, "quit").await?;
+    if outcome != Outcome::Completed {
+        return Ok(outcome);
+    }
     wait_until_pi_exits(herdr_path, &candidate.pane_id).await?;
     progress.update(completed, total, &format!("{} starting", candidate.pane_id))?;
     let safe_session_path = escape(std::borrow::Cow::Borrowed(&candidate.session_path));
@@ -209,7 +216,8 @@ async fn reset_one_candidate(
     )
     .await?;
     progress.update(completed, total, &format!("{} waiting", candidate.pane_id))?;
-    wait_until_pi_ready(herdr_path, candidate).await
+    wait_until_pi_ready(herdr_path, candidate).await?;
+    Ok(Outcome::Completed)
 }
 
 pub(crate) async fn reset_all_pi(
@@ -221,6 +229,7 @@ pub(crate) async fn reset_all_pi(
     let mut summary = ResetSummary {
         reset: 0,
         visited: 0,
+        skipped_drafts: 0,
         skipped_non_pi: counts.skipped_non_pi,
         skipped_unsafe_status: counts.skipped_unsafe_status,
         failed: counts.skipped_invalid_agent_data
@@ -289,8 +298,23 @@ pub(crate) async fn reset_all_pi(
                     .push(format!("{} skipped (not Pi)", candidate.pane_id));
                 continue;
             }
-            match reset_one_candidate(herdr_path, candidate, &progress, completed, total).await {
-                Ok(()) => {
+            match reset_one_candidate(herdr_path, candidate, agent, &progress, completed, total)
+                .await
+            {
+                Ok(Outcome::Draft) => {
+                    summary.skipped_drafts += 1;
+                    summary.outcomes.push(format!(
+                        "{} skipped (unsent draft left untouched)",
+                        candidate.pane_id
+                    ));
+                }
+                Ok(Outcome::Busy) => {
+                    summary.skipped_unsafe_status += 1;
+                    summary
+                        .outcomes
+                        .push(format!("{} skipped (Pi became busy)", candidate.pane_id));
+                }
+                Ok(Outcome::Completed) => {
                     summary.reset += 1;
                     summary
                         .outcomes
@@ -347,6 +371,7 @@ pub(crate) async fn reset_all_pi(
 pub async fn reload_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ReloadSummary {
     let mut reload_summary = ReloadSummary {
         reloaded: 0,
+        skipped_drafts: 0,
         skipped_non_pi: 0,
         skipped_unsafe_status: 0,
         skipped_invalid_agent_data: 0,
@@ -396,10 +421,10 @@ pub async fn reload_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ReloadSumm
         }
 
         if agent_status == "done" || agent_status == "idle" {
-            let reload_pane_status = run_in_pane(herdr_path, pane_id, "/reload").await;
-
-            match reload_pane_status {
-                Ok(_) => reload_summary.reloaded += 1,
+            match guard::control(herdr_path, agent, "reload").await {
+                Ok(Outcome::Completed) => reload_summary.reloaded += 1,
+                Ok(Outcome::Draft) => reload_summary.skipped_drafts += 1,
+                Ok(Outcome::Busy) => reload_summary.skipped_unsafe_status += 1,
                 Err(error) => {
                     reload_summary.failed += 1;
                     reload_summary.errors.push(error);

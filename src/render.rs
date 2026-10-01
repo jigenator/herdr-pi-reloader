@@ -39,8 +39,10 @@ pub(crate) fn render_menu(frame: &mut Frame, main_area: Rect, footer_area: Rect,
 }
 
 pub(crate) fn render_running_reload(frame: &mut Frame, main_area: Rect, footer_area: Rect) {
-    let main = Paragraph::new("Reloading Pi instances...")
-        .block(Block::bordered().title("Herdr Pi Reloader"));
+    let main = Paragraph::new(
+        "Reloading Pi instances...\nUnsent drafts are skipped, not submitted or cleared.",
+    )
+    .block(Block::bordered().title("Herdr Pi Reloader"));
     let footer = Paragraph::new("Operation in progress...");
 
     frame.render_widget(main, main_area);
@@ -74,6 +76,7 @@ pub(crate) fn render_reload_result(
         heading_line,
         Line::from(""),
         Line::from(format!("Reloaded: {}", result.reloaded)),
+        Line::from(format!("Skipped (drafts): {}", result.skipped_drafts)),
         Line::from(format!("Skipped (busy): {}", result.skipped_unsafe_status)),
         Line::from(format!("Skipped (not Pi): {}", result.skipped_non_pi)),
         Line::from(format!("Failed: {}", failed)),
@@ -166,6 +169,7 @@ pub(crate) fn render_reset_result(
         Line::from(""),
         Line::from(format!("Reset: {}", result.reset)),
         Line::from(format!("Visited: {}", result.visited)),
+        Line::from(format!("Skipped (drafts): {}", result.skipped_drafts)),
         Line::from(format!("Skipped (busy): {}", result.skipped_unsafe_status)),
         Line::from(format!("Skipped (not Pi): {}", result.skipped_non_pi)),
         Line::from(format!("Failed: {}", failed)),

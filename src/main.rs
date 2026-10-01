@@ -1,3 +1,4 @@
+mod guard;
 mod herdr;
 mod pi;
 mod progress;

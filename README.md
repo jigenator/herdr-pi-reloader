@@ -2,7 +2,10 @@
 
 A small [Herdr](https://herdr.dev/) plugin for safely reloading or restarting Pi agent sessions from a popup TUI without changing the tiled tab layout.
 
-The plugin only operates on Pi agents that Herdr reports as `idle` or `done`. Busy agents are skipped.
+The plugin only operates on Pi agents that Herdr reports as `idle` or `done`.
+A companion Pi extension checks the actual editor and invokes native Pi APIs.
+Busy agents, queued messages, and **unsent prompt-editor drafts are skipped**;
+drafts are never submitted, cleared, or copied out of Pi.
 
 This fork of [anrunt/herdr-pi-reloader](https://github.com/anrunt/herdr-pi-reloader)
 fixes Herdr 0.9 process detection (`name: "node", argv0: "pi"`) and reports non-Pi
@@ -13,15 +16,16 @@ skips instead of misleading zero counts. The plugin and action IDs are unchanged
 
 ## Features
 
-- **Reload all Pi** sends `/reload` to every eligible Pi pane.
+- **Reload all Pi** invokes Pi's reload API and verifies a replacement guard runtime.
 - **Reset all Pi** restarts eligible panes **one at a time**, waits for each recorded session to become ready, and briefly visits panes that were previously reported `idle` to acknowledge startup badges.
 - Shows reset progress in Herdr's top-right bar, then returns to the original pane/popup with completed, skipped, and failed counts.
-- Rechecks each pane before quitting; busy, non-Pi, and changed sessions are not reset. Concurrent resets on the same server are rejected.
+- Rechecks each pane before quitting; busy, non-Pi, changed sessions, and drafts are not reset. Concurrent resets on the same server are rejected.
+- Neither operation types a slash command. Missing/unresponsive guards fail closed, without a terminal-input fallback.
 
 ## Requirements
 
 - Herdr 0.9.0 or newer
-- The [Pi coding agent](https://github.com/badlogic/pi-mono) available on `PATH`
+- The [Pi coding agent](https://pi.dev/), version 1.0 or newer, available on `PATH`
 - The Herdr Pi integration
 - Rust 1.89 or newer with Cargo (required to build the plugin during installation)
 - Linux or macOS
@@ -54,6 +58,32 @@ Confirm that it is installed and enabled:
 herdr plugin list
 herdr plugin action list --plugin herdr-pi-reloader.pi-reloader
 ```
+
+### Draft guard — required once per Pi configuration
+
+Link the included extension into Pi's global extension directory:
+
+```sh
+mkdir -p "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions"
+ln -s "/absolute/plugin/root/extensions/herdr-pi-reloader.ts" \
+  "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/herdr-pi-reloader.ts"
+```
+
+Use `plugin_root` from `herdr plugin list --plugin herdr-pi-reloader.pi-reloader --json`
+for `/absolute/plugin/root`. Do not overwrite an existing extension without checking
+it first. The symlink follows future plugin upgrades; the Herdr-managed
+`herdr-agent-state.ts` integration is not modified.
+
+**For each already-running Pi, manually run `/reload` once when its editor is empty.**
+Do not append it to a draft. New Pi processes load the guard automatically. Until
+loaded, the reloader reports a guard error and leaves the pane untouched.
+Sessions using a different `PI_CODING_AGENT_DIR` need the link in that directory.
+
+The guard uses a private Unix socket in `/tmp/herdr-pi-reloader-<uid>/<pid>.sock`,
+checks server/pane/process/session/runtime identity, and rechecks idle/queue/editor
+state immediately before acting. It exposes no draft text. A stale or conflicting
+socket is never replaced automatically; such a pane remains ineligible until its
+guard is available. Normal shutdown/reload removes the socket.
 
 ## Usage
 
@@ -116,8 +146,9 @@ and a foreground Pi process—not just successful command submission.
 
 **Live testing is manual.** Reset affects every eligible Pi session, including an
 assistant's own idle session. Finish automated work before testing from the popup.
-The CLI `reset` entrypoint also moves focus and requires `HERDR_SOCKET_PATH`;
-`reload` retains its existing behavior.
+The CLI `reset` entrypoint also moves focus. Both `reload` and `reset` require
+`HERDR_SOCKET_PATH` and the loaded draft guard. `Skipped (drafts)` means the pane
+was not reloaded, restarted, or deliberately visited.
 
 ## Updating
 
@@ -131,9 +162,14 @@ Use `--ref` with a commit or tag to pin a specific revision.
 
 ## Uninstalling
 
+Remove the guard symlink you created, then uninstall the plugin:
+
 ```sh
+rm "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/herdr-pi-reloader.ts"
 herdr plugin uninstall jigenator/herdr-pi-reloader
 ```
+
+Running Pi processes release the loaded guard on their next manual reload or exit.
 
 ## Local development
 
@@ -171,7 +207,9 @@ The Python checks use a fake Herdr executable and isolated environment. Reload/r
 commands are recorded, never executed against live panes. They cover current and legacy
 process identity, non-Pi rejection, refreshed busy/session guards, process errors,
 quoted session resume, shell/startup readiness, focus restoration, progress isolation,
-and crash-safe locking.
+and crash-safe locking. They also reject missing/untrusted guards, drafts and busy
+transitions during dispatch, and reloads without a replacement runtime. A Node
+check runs the real extension against a small context stub (Node 22.18+ required).
 
 An opt-in integration test starts a real Herdr server and native TUI in a private
 PTY with a temporary HOME/socket and a fake `pi` executable first on PATH:
@@ -181,9 +219,21 @@ HERDR_RELOADER_ISOLATED=1 python3 -m unittest discover -s tests -p test_isolated
 ```
 
 It checks sequential restarts, session preservation, busy skips, visible progress,
-client idle badges, and return to the original popup. It requires Node and Bash;
-no real Pi sessions are started or reset. Logs/screens remain in the printed
-`/tmp/pir-ui-*` evidence directory. `RELOADER_BINARY` selects another build.
+client idle badges, and return to the original popup. It requires Node 22.18+ and
+Bash, and uses the real guard extension with the fake Pi. No real Pi sessions are
+started or reset. Logs/screens remain in the printed `/tmp/pir-ui-*` evidence
+directory. `RELOADER_BINARY` selects another build.
+
+A separate opt-in check starts **fresh, isolated real Pi processes**, with no
+credentials, tools, or automatic network activity, never an existing user session:
+
+```sh
+HERDR_RELOADER_PI_ISOLATED=1 python3 -m unittest discover -s tests -p test_pi_guard.py -v
+```
+
+It verifies extension symlink discovery, native reload/shutdown, single-line,
+multiline/bracketed-paste and whitespace drafts, cursor preservation, stale identity
+rejection, and absence of prompt submission. Evidence stays in `/tmp/pir-real-pi-*`.
 
 ## Contributing
 

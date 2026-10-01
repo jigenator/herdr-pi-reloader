@@ -56,8 +56,8 @@ elif args[:3] == ['pane', 'process-info', '--pane']:
 elif args[:2] == ['pane', 'run']:
     # Record, NEVER execute or forward these commands.
     pane = state.setdefault(args[2], {})
-    if args[3] == '/quit': pane['quit'] = True
-    elif args[3].startswith('pi --session '):
+    assert args[3].startswith('pi --session '), 'Slash commands must NEVER enter the editor'
+    if args[3].startswith('pi --session '):
         if fixture.get('start_error') == args[2]: sys.exit('mock start failure')
         expected = next(a['agent_session']['value'] for a in fixture['agents'] if a['pane_id'] == args[2])
         assert shlex.split(args[3]) == ['pi', '--session', expected]
@@ -82,7 +82,7 @@ def fixture(process=None, status='idle', session=True, count=1, **options):
             if session:
                 agent['agent_session'] = {'agent': 'pi', 'kind': 'path', 'value': str(root / f"session {i} 'quotes' $(no-evaluation).jsonl")}
             agents.append(agent)
-        data = dict(agents=agents, process=process or {'name': 'node', 'argv0': 'pi', 'pid': 20}, **options)
+        data = dict(agents=agents, process=dict(process or {'name': 'node', 'argv0': 'pi'}, pid=os.getpid()), **options)
         (root / 'fixture.json').write_text(json.dumps(data))
         (root / 'calls.jsonl').touch()
         herdr = root / 'fake-herdr'
@@ -118,12 +118,49 @@ def fixture(process=None, status='idle', session=True, count=1, **options):
                     else:
                         response = {'error': {'message': 'unexpected test API method'}}
                     connection.sendall((json.dumps(response) + '\n').encode())
+        guard_dir = Path(f'/tmp/herdr-pi-reloader-{os.getuid()}')
+        guard_dir.mkdir(mode=0o700, exist_ok=True)
+        guard_path = guard_dir / f'{os.getpid()}.sock'
+        guard_listener = socket.socket(socket.AF_UNIX)
+        if not options.get('guard_missing'):
+            guard_listener.bind(str(guard_path)); guard_listener.listen(); guard_listener.settimeout(.1)
+            guard_path.chmod(0o666 if options.get('guard_public') else 0o600)
+        generations = {}
+
+        def serve_guard():
+            while not stopped.is_set() and not options.get('guard_missing'):
+                try: connection, _ = guard_listener.accept()
+                except socket.timeout: continue
+                with connection:
+                    request = json.loads(connection.makefile('rb').readline())
+                    pane, action = request['pane_id'], request['action']
+                    with (root / 'calls.jsonl').open('a') as log:
+                        log.write(json.dumps(['guard', action, pane]) + '\n')
+                    generation = generations.get(pane, 'initial')
+                    status = 'ready'
+                    if options.get('draft') or (action != 'probe' and options.get('guard_becomes_draft')): status = 'draft'
+                    if options.get('guard_busy') or (action != 'probe' and options.get('guard_becomes_busy')): status = 'busy'
+                    response = dict(request, status=status, generation=generation)
+                    if action != 'probe' and status == 'ready':
+                        response['status'] = 'accepted'
+                        if action == 'quit':
+                            state_path = root / 'state.json'
+                            state = json.loads(state_path.read_text())
+                            state.setdefault(pane, {})['quit'] = True
+                            state_path.write_text(json.dumps(state))
+                        elif not options.get('reload_no_new_generation'):
+                            generations[pane] = 'replacement'
+                    if options.get('guard_wrong_identity'): response['pid'] += 1
+                    connection.sendall((json.dumps(response) + '\n').encode())
         thread = threading.Thread(target=serve)
-        thread.start()
+        guard_thread = threading.Thread(target=serve_guard)
+        thread.start(); guard_thread.start()
         try:
             yield root, env, agents, snapshots
         finally:
-            stopped.set(); thread.join(3); listener.close()
+            stopped.set(); thread.join(3); guard_thread.join(3)
+            listener.close(); guard_listener.close()
+            if not options.get('guard_missing'): guard_path.unlink()
 
 
 def calls_at(root):
@@ -149,18 +186,19 @@ class CliTests(unittest.TestCase):
             with self.subTest(process=process):
                 output, calls, _, _ = self.run_cli('reload', process=process)
                 self.assertIn('reloaded: 1', output)
-                self.assertEqual([c for c in calls if c[:2] == ['pane', 'run']], [['pane', 'run', 'w2:p1', '/reload']])
+                self.assertFalse(any(c[:2] == ['pane', 'run'] for c in calls))
+                self.assertIn(['guard', 'reload', 'w2:p1'], calls)
 
     def test_reset_waits_for_shell_and_ready_session_then_restores_focus(self):
         output, calls, agents, progress = self.run_cli('reset', count=2, ready_delay=.4)
         self.assertIn('reset: 2', output); self.assertIn('visited: 2', output)
         self.assertEqual(focus_calls(calls), ['w2:p1', 'w3:p1', 'w1:p1'])
         runs = [c for c in calls if c[:2] == ['pane', 'run']]
-        self.assertEqual([c[2] for c in runs], ['w2:p1', 'w2:p1', 'w3:p1', 'w3:p1'])
+        self.assertEqual([c[2] for c in runs], ['w2:p1', 'w3:p1'])
         for index, agent in enumerate(agents):
-            quit_index = calls.index(['pane', 'run', agent['pane_id'], '/quit'])
+            quit_index = calls.index(['guard', 'quit', agent['pane_id']])
             self.assertEqual(calls[quit_index + 1], ['pane', 'process-info', '--pane', agent['pane_id']])
-            self.assertEqual(shlex.split(runs[index * 2 + 1][3]), ['pi', '--session', agent['agent_session']['value']])
+            self.assertEqual(shlex.split(runs[index][3]), ['pi', '--session', agent['agent_session']['value']])
             self.assertIn('agent', calls[quit_index + 2])  # Old lifecycle must disappear before restart.
         self.assertTrue(any('1/2' in text and 'viewing' in text for text in progress))
         self.assertIn('returning', progress[-1])
@@ -203,7 +241,8 @@ class CliTests(unittest.TestCase):
     def test_foreign_process_after_quit_never_receives_start_command(self):
         output, calls, _, _ = self.run_cli('reset', foreign_process=True)
         self.assertIn('shell not ready', output)
-        self.assertEqual([c for c in calls if c[:2] == ['pane', 'run']], [['pane', 'run', 'w2:p1', '/quit']])
+        self.assertEqual([c for c in calls if c[:2] == ['pane', 'run']], [])
+        self.assertIn(['guard', 'quit', 'w2:p1'], calls)
         self.assertEqual(focus_calls(calls), [])
 
     def test_wrong_resumed_session_is_not_successful_or_focused(self):
@@ -248,6 +287,32 @@ class CliTests(unittest.TestCase):
             finally:
                 reset.kill(); reset.communicate(timeout=5)
             self.assertEqual(subprocess.check_output([str(BINARY), 'status'], env=env), b'')
+
+    def test_drafts_and_guard_busy_skip_without_terminal_input_or_focus(self):
+        for option, expected in [('draft', 'skipped_drafts: 1'), ('guard_becomes_draft', 'skipped_drafts: 1'),
+                                 ('guard_busy', 'skipped_unsafe_status: 1'), ('guard_becomes_busy', 'skipped_unsafe_status: 1')]:
+            for command in ('reload', 'reset'):
+                with self.subTest(option=option, command=command):
+                    output, calls, _, _ = self.run_cli(command, **{option: True})
+                    self.assertIn(expected, output)
+                    self.assertIn('failed: 0', output)
+                    self.assertFalse(any(c[:2] == ['pane', 'run'] for c in calls))
+                    self.assertEqual(focus_calls(calls), [])
+
+    def test_missing_public_or_wrong_guard_has_no_unsafe_fallback(self):
+        for option in ('guard_missing', 'guard_public', 'guard_wrong_identity'):
+            for command in ('reload', 'reset'):
+                with self.subTest(option=option, command=command):
+                    output, calls, _, _ = self.run_cli(command, **{option: True})
+                    self.assertIn('failed: 1', output)
+                    self.assertFalse(any(c[:2] == ['pane', 'run'] or c[:2] in (['guard', 'quit'], ['guard', 'reload']) for c in calls))
+                    self.assertEqual(focus_calls(calls), [])
+
+    def test_reload_requires_a_replacement_runtime_not_just_acceptance(self):
+        output, calls, _, _ = self.run_cli('reload', reload_no_new_generation=True)
+        self.assertIn('reloaded: 0', output)
+        self.assertIn('reload did not confirm a new guard runtime', output)
+        self.assertFalse(any(c[:2] == ['pane', 'run'] for c in calls))
 
     def test_missing_origin_aborts_before_mutation(self):
         with fixture(origin_error=True) as (root, env, _, _):

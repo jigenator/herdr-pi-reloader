@@ -46,16 +46,29 @@ struct ForegroundProcess {
     argv: Option<Vec<String>>,
 }
 
+impl ForegroundProcess {
+    fn is_pi(&self) -> bool {
+        self.name == "pi"
+            || self
+                .argv0
+                .as_ref()
+                .or_else(|| self.argv.as_ref().and_then(|args| args.first()))
+                .and_then(|arg| Path::new(arg).file_name())
+                .is_some_and(|name| name == "pi")
+    }
+}
+
 impl ProcessInfo {
     pub(crate) fn is_pi(&self) -> bool {
-        self.foreground_processes.iter().any(|p| {
-            p.name == "pi"
-                || p.argv0
-                    .as_ref()
-                    .or_else(|| p.argv.as_ref().and_then(|args| args.first()))
-                    .and_then(|arg| Path::new(arg).file_name())
-                    .is_some_and(|name| name == "pi")
-        })
+        self.foreground_processes
+            .iter()
+            .any(ForegroundProcess::is_pi)
+    }
+
+    pub(crate) fn pi_pid(&self) -> Option<u32> {
+        let mut processes = self.foreground_processes.iter().filter(|p| p.is_pi());
+        let pid = processes.next()?.pid.filter(|pid| *pid > 0)?;
+        processes.next().is_none().then_some(pid)
     }
 
     pub(crate) fn is_shell(&self) -> bool {
@@ -107,7 +120,7 @@ pub(crate) fn socket_path() -> Result<String, String> {
     env::var("HERDR_SOCKET_PATH")
         .ok()
         .filter(|path| !path.is_empty())
-        .ok_or_else(|| "Reset/status requires HERDR_SOCKET_PATH; run from Herdr".into())
+        .ok_or_else(|| "Pi Reloader requires HERDR_SOCKET_PATH; run from Herdr".into())
 }
 
 // `agent focus` does not switch native clients in Herdr 0.9. Use the public pane API.

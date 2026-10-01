@@ -83,7 +83,8 @@ class IsolatedHerdrTest(unittest.TestCase):
         self.bin = self.base / 'bin'; self.bin.mkdir()
         self.env = {'HOME': str(self.home), 'PATH': f'{self.bin}:{os.environ["PATH"]}',
                     'TERM': 'xterm-256color', 'LANG': 'en_US.UTF-8', 'SHELL': BASH,
-                    'HERDR_DISABLE_SOUND': '1', 'HERDR_SOCKET_PATH': self.socket, 'HERDR_BIN_PATH': HERDR}
+                    'HERDR_DISABLE_SOUND': '1', 'HERDR_SOCKET_PATH': self.socket, 'HERDR_BIN_PATH': HERDR,
+                    'GUARD_EXTENSION': str(ROOT / 'extensions/herdr-pi-reloader.ts')}
         self.client_pid = self.master = None
         self.server_log = open(self.base / 'server.log', 'wb')
         self.raw = open(self.base / 'client.ansi', 'wb')
@@ -104,7 +105,7 @@ tab_bar_right = [{{ type = "command", command = {json.dumps(command)}, interval_
 [ui.sidebar.agents]
 rows = [["workspace", "state_text"], ["agent"]]
 ''')
-        # This fake process handles only /quit and lifecycle reports on OUR socket.
+        # Fake Pi lifecycle/editor, with the REAL guard extension on OUR process/socket.
         fake = self.base / 'fake-pi.js'
         fake.write_text('''const fs = require('fs'), cp = require('child_process');
 const root = require('path').dirname(process.env.HOME);
@@ -117,9 +118,31 @@ console.log('FAKE_PI_READY ' + process.env.HERDR_PANE_ID);
 process.stdin.setRawMode(true);
 let input = '';
 process.stdin.on('data', data => {
-  input += data.toString();
-  if (input.includes('/quit\\r') || input.includes('/quit\\n')) process.exit(0);
+  // Focus reports are not editor text. Unlike the old fixture, a /quit substring
+  // in an ordinary draft is NOT a command.
+  input += data.toString().replace(/\\x1b\\[[IO]/g, '');
+  if (input === '/quit\\r' || input === '/quit\\n') process.exit(0);
+  if (input.includes('\\r') || input.includes('\\n')) throw Error('Unexpected editor submission: ' + input);
 });
+const handlers = {}, commands = {};
+const ctx = {
+  mode: 'tui', isIdle: () => !busy, hasPendingMessages: () => false,
+  sessionManager: {getSessionFile: () => session},
+  ui: {getEditorText: () => input, notify: text => console.error(text)},
+  shutdown: () => { handlers.session_shutdown().then(() => process.exit(0)); },
+  reload: async () => { throw Error('This isolated UI test resets only'); },
+};
+require(process.env.GUARD_EXTENSION).default({
+  on: (name, handler) => { handlers[name] = handler; },
+  registerCommand: (name, command) => { commands[name] = command; },
+  getCommands: () => Object.keys(commands).map(name => ({name, source: 'extension'})),
+  sendUserMessage: (text, options) => {
+    if (!options.expandPromptTemplates) throw Error('Command expansion required');
+    const [name, token] = text.slice(1).split(' ');
+    commands[name].handler(token, ctx);
+  },
+});
+handlers.session_start({}, ctx);
 function report(state) {
   const args = ['pane',state === 'startup' ? 'report-agent-session' : 'report-agent',process.env.HERDR_PANE_ID,
     '--source','herdr:pi','--agent','pi','--seq',String(Date.now()),'--agent-session-path',session];
@@ -195,6 +218,12 @@ setTimeout(() => report(busy ? 'working' : 'idle'), 650);
             self.cli('server', 'stop', check=False)
             try: self.server.wait(10)
             except subprocess.TimeoutExpired: self.server.kill(); self.server.wait()
+        starts = self.base / 'starts.jsonl'
+        if starts.exists():
+            for item in map(json.loads, starts.read_text().splitlines()):
+                try: os.kill(item['pid'], 0)
+                except ProcessLookupError:
+                    Path(f'/tmp/herdr-pi-reloader-{os.getuid()}/{item["pid"]}.sock').unlink(missing_ok=True)
         self.server_log.close(); self.raw.close()
 
     def test_popup_reset_progress_focus_and_restore(self):
