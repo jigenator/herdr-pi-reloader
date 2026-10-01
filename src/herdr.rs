@@ -53,6 +53,8 @@ struct ForegroundProcess {
     #[serde(default)]
     name: String,
     #[serde(default)]
+    argv0: Option<String>,
+    #[serde(default)]
     argv: Vec<String>
 }
 
@@ -157,8 +159,9 @@ pub async fn is_pi_running_in_pane(herdr_path: &str, pane_id: &str) -> Result<Pa
                 if p.name == "pi" {
                     return Ok(PanePiStatus::RunningPi);
                 }
-                if p.argv
-                    .first()
+                if p.argv0
+                    .as_ref()
+                    .or_else(|| p.argv.first())
                     .and_then(|arg| Path::new(arg).file_name())
                     .is_some_and(|name| name == "pi")
                 {

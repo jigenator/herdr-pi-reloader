@@ -19,6 +19,7 @@ pub struct ReloadSummary {
 #[derive(Debug)]
 pub struct ResetSummary {
     pub(crate) reset: usize,
+    pub(crate) skipped_non_pi: usize,
     pub(crate) skipped_unsafe_status: usize,
     pub(crate) failed: usize,
     pub(crate) errors: Vec<String>
@@ -79,6 +80,7 @@ pub async fn get_reset_candidates(herdr_path: &str, agent_list: &[AgentInfo]) ->
         match is_pi_running_in_pane(herdr_path, &value.pane_id).await {
             Ok(pane_status) => {
                 if matches!(pane_status, PanePiStatus::NonPi) {
+                    reset_candidates_summary.skipped_non_pi += 1;
                     continue;
                 }
             },
@@ -196,6 +198,7 @@ pub(crate) async fn reset_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> Rese
 
     let mut reset_summary = ResetSummary {
         reset: 0,
+        skipped_non_pi: candidates_summary.skipped_non_pi,
         skipped_unsafe_status: candidates_summary.skipped_unsafe_status,
         failed: candidates_summary.skipped_invalid_agent_data + candidates_summary.skipped_missing_session + candidates_summary.skipped_invalid_session,
         errors: Vec::new()

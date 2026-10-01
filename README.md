@@ -4,6 +4,10 @@ A small [Herdr](https://herdr.dev/) plugin for safely reloading or restarting Pi
 
 The plugin only operates on Pi agents that Herdr reports as `idle` or `done`. Busy agents are skipped.
 
+This fork of [anrunt/herdr-pi-reloader](https://github.com/anrunt/herdr-pi-reloader)
+fixes Herdr 0.9 process detection (`name: "node", argv0: "pi"`) and reports non-Pi
+skips instead of misleading zero counts. The plugin and action IDs are unchanged.
+
 ## Preview
 ![Herdr Pi Reloader popup with reset and reload actions](https://github.com/user-attachments/assets/09346711-c37e-4ad4-a422-0e05b0a3ce90)
 
@@ -29,10 +33,16 @@ Install the Herdr integration for Pi first:
 herdr integration install pi
 ```
 
-Then install the plugin from GitHub:
+If the upstream plugin is already installed, uninstall it first:
 
 ```sh
-herdr plugin install anrunt/herdr-pi-reloader
+herdr plugin uninstall anrunt/herdr-pi-reloader
+```
+
+Then install this fork:
+
+```sh
+herdr plugin install jigenator/herdr-pi-reloader
 ```
 
 Herdr shows the repository and build commands for review before installation. The plugin is compiled locally with Cargo and stored in Herdr's managed plugin directory.
@@ -59,44 +69,26 @@ Inside the popup:
 - `Enter` — run the selected operation
 - `q`, `Esc`, or `Ctrl+C` — close (disabled while a reset is running)
 
-### Optional keybinding
+With [Herdr Spotlight](https://github.com/jigenator/herdr-spotlight), search for
+**Open Pi Reloader**. No separate reset/reloader shortcut or plugin configuration is needed.
 
-Add a plugin action binding to `~/.config/herdr/config.toml`:
-
-```toml
-[[keys.command]]
-key = "prefix+alt+r"
-type = "plugin_action"
-command = "herdr-pi-reloader.pi-reloader.open"
-description = "open Pi Reloader"
-```
-
-Apply the configuration without restarting panes:
-
-```sh
-herdr server reload-config
-```
-
-No additional plugin-specific configuration is required.
+**Live testing is manual.** Reset affects every eligible Pi session, including an
+assistant's own idle session. Finish automated work before testing from the popup.
 
 ## Updating
 
-Herdr does not currently provide a separate plugin update command. Reinstall the plugin to replace the managed checkout with the latest version:
+Reinstall from the fork to replace its managed checkout with the latest version:
 
 ```sh
-herdr plugin install anrunt/herdr-pi-reloader
+herdr plugin install jigenator/herdr-pi-reloader
 ```
 
-To install a reproducible release instead, pin a Git tag:
-
-```sh
-herdr plugin install anrunt/herdr-pi-reloader --ref v0.1.2
-```
+Use `--ref` with a commit or tag to pin a specific revision.
 
 ## Uninstalling
 
 ```sh
-herdr plugin uninstall anrunt/herdr-pi-reloader
+herdr plugin uninstall jigenator/herdr-pi-reloader
 ```
 
 ## Local development
@@ -104,7 +96,7 @@ herdr plugin uninstall anrunt/herdr-pi-reloader
 Herdr does not run manifest build commands for locally linked plugins, so build the binary first:
 
 ```sh
-git clone https://github.com/anrunt/herdr-pi-reloader.git
+git clone https://github.com/jigenator/herdr-pi-reloader.git
 cd herdr-pi-reloader
 cargo build --release --locked
 herdr plugin link .
@@ -123,9 +115,21 @@ herdr plugin log list --plugin herdr-pi-reloader.pi-reloader
 herdr plugin unlink herdr-pi-reloader.pi-reloader
 ```
 
+## Tests
+
+```sh
+cargo test --locked
+cargo build --locked
+python3 -m unittest discover -s tests -v
+```
+
+The Python checks use a fake Herdr executable and isolated environment. Reload/reset
+commands are recorded, never executed against live panes. They cover current and legacy
+process identity, non-Pi rejection, busy/session guards, process errors, and quoted session resume.
+
 ## Contributing
 
-Contributions are highly welcome. If you have an idea for improving the workflow, user experience, reliability, or platform support, feel free to [open an issue](https://github.com/anrunt/herdr-pi-reloader/issues) or submit a pull request.
+Contributions are highly welcome. If you have an idea for improving the workflow, user experience, reliability, or platform support, feel free to [open an issue](https://github.com/jigenator/herdr-pi-reloader/issues) or submit a pull request.
 
 Please report any bugs or unexpected behavior through GitHub Issues. When possible, include your Herdr and plugin versions, operating system, reproduction steps, expected and actual behavior, and relevant plugin logs.
 

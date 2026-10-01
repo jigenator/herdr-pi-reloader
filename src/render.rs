@@ -75,7 +75,8 @@ pub(crate) fn render_reload_result(
         heading_line,
         Line::from(""),
         Line::from(format!("Reloaded: {}", result.reloaded)),
-        Line::from(format!("Skipped: {}", result.skipped_unsafe_status)),
+        Line::from(format!("Skipped (busy): {}", result.skipped_unsafe_status)),
+        Line::from(format!("Skipped (not Pi): {}", result.skipped_non_pi)),
         Line::from(format!("Failed: {}", failed)),
     ];
 
@@ -167,7 +168,8 @@ pub(crate) fn render_reset_result(
         heading_line,
         Line::from(""),
         Line::from(format!("Reset: {}", result.reset)),
-        Line::from(format!("Skipped: {}", result.skipped_unsafe_status)),
+        Line::from(format!("Skipped (busy): {}", result.skipped_unsafe_status)),
+        Line::from(format!("Skipped (not Pi): {}", result.skipped_non_pi)),
         Line::from(format!("Failed: {}", failed)),
     ];
 

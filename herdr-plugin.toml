@@ -1,6 +1,6 @@
 id = "herdr-pi-reloader.pi-reloader"
 name = "Herdr Pi Reloader"
-version = "0.1.2"
+version = "0.1.3"
 min_herdr_version = "0.7.4"
 description = "Reload or restart idle Pi agent sessions from a Herdr popup"
 platforms = ["linux", "macos"]
