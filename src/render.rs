@@ -1,17 +1,12 @@
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use ratatui::Frame;
 
 use crate::pi::{ReloadSummary, ResetSummary};
 
-pub(crate) fn render_menu(
-    frame: &mut Frame,
-    main_area: Rect,
-    footer_area: Rect,
-    selected: usize,
-) {
+pub(crate) fn render_menu(frame: &mut Frame, main_area: Rect, footer_area: Rect, selected: usize) {
     let menu_text_options = ["Reload all Pi", "Reset all Pi"];
 
     let menu_text = menu_text_options
@@ -33,7 +28,11 @@ pub(crate) fn render_menu(
         .collect::<Vec<Line<'_>>>();
 
     let main = Paragraph::new(menu_text).block(Block::bordered().title("Herdr Pi Reloader"));
-    let footer = Paragraph::new("↑/k ↓/j select • Enter run • q/Esc quit");
+    let footer = Paragraph::new(if selected == 1 {
+        "Reset moves focus. Don't type until the summary."
+    } else {
+        "↑/k ↓/j select • Enter run • q/Esc quit"
+    });
 
     frame.render_widget(main, main_area);
     frame.render_widget(footer, footer_area);
@@ -101,10 +100,7 @@ pub(crate) fn render_reload_result(
 
         if hidden_errors > 0 {
             lines.push(Line::from(""));
-            lines.push(Line::from(format!(
-                "...and {} more errors",
-                hidden_errors
-            )));
+            lines.push(Line::from(format!("...and {} more errors", hidden_errors)));
         }
     }
 
@@ -115,12 +111,7 @@ pub(crate) fn render_reload_result(
     frame.render_widget(footer, footer_area);
 }
 
-pub(crate) fn render_error(
-    frame: &mut Frame,
-    main_area: Rect,
-    footer_area: Rect,
-    error: &str,
-) {
+pub(crate) fn render_error(frame: &mut Frame, main_area: Rect, footer_area: Rect, error: &str) {
     let main = Paragraph::new(error).block(Block::bordered().title("Herdr Pi Reloader"));
     let footer = Paragraph::new("Enter/q/Esc quit");
 
@@ -128,14 +119,20 @@ pub(crate) fn render_error(
     frame.render_widget(footer, footer_area);
 }
 
-pub(crate) fn render_running_reset(frame: &mut Frame, main_area: Rect, footer_area: Rect, spinner_frame: &usize) {
+pub(crate) fn render_running_reset(
+    frame: &mut Frame,
+    main_area: Rect,
+    footer_area: Rect,
+    spinner_frame: &usize,
+) {
     let frames = ["-", "\\", "|", "/"];
 
     let current_frame = frames[spinner_frame % frames.len()];
 
-    let main = Paragraph::new(format!("{} Resetting Pi instances...", current_frame))
+    let status = crate::progress::status_line();
+    let main = Paragraph::new(format!("{current_frame} Resetting Pi instances...\n\n{status}\n\nDo not type or switch panes.\nInput is NOT blocked outside this tab."))
         .block(Block::bordered().title("Herdr Pi Reloader"));
-    let footer = Paragraph::new("Operation in progress...");
+    let footer = Paragraph::new("Wait for the summary before using Herdr.");
 
     frame.render_widget(main, main_area);
     frame.render_widget(footer, footer_area);
@@ -168,10 +165,27 @@ pub(crate) fn render_reset_result(
         heading_line,
         Line::from(""),
         Line::from(format!("Reset: {}", result.reset)),
+        Line::from(format!("Visited: {}", result.visited)),
         Line::from(format!("Skipped (busy): {}", result.skipped_unsafe_status)),
         Line::from(format!("Skipped (not Pi): {}", result.skipped_non_pi)),
         Line::from(format!("Failed: {}", failed)),
     ];
+    if result.errors.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(
+            result
+                .outcomes
+                .iter()
+                .take(5)
+                .map(|text| Line::from(text.as_str())),
+        );
+        if result.outcomes.len() > 5 {
+            lines.push(Line::from(format!(
+                "...and {} more panes",
+                result.outcomes.len() - 5
+            )));
+        }
+    }
 
     if !result.errors.is_empty() {
         let max_errors = 5;
@@ -194,10 +208,7 @@ pub(crate) fn render_reset_result(
 
         if hidden_errors > 0 {
             lines.push(Line::from(""));
-            lines.push(Line::from(format!(
-                "...and {} more errors",
-                hidden_errors
-            )));
+            lines.push(Line::from(format!("...and {} more errors", hidden_errors)));
         }
     }
 

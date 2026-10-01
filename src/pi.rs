@@ -1,10 +1,13 @@
-use std::{time::Duration};
-use tokio::task::JoinHandle;
+use std::time::Duration;
 
 use shell_escape::unix::escape;
 use tokio::time::{self, timeout};
 
-use crate::herdr::{AgentInfo, PanePiStatus, is_pi_running_in_pane, run_in_pane};
+use crate::herdr::{
+    AgentInfo, PanePiStatus, focus_pane, get_agent_list, get_pane_process_info,
+    is_pi_running_in_pane, original_pane, run_in_pane,
+};
+use crate::progress::Progress;
 
 #[derive(Debug, PartialEq)]
 pub struct ReloadSummary {
@@ -13,36 +16,53 @@ pub struct ReloadSummary {
     pub(crate) skipped_unsafe_status: usize,
     pub(crate) skipped_invalid_agent_data: usize,
     pub(crate) failed: usize,
-    pub(crate) errors: Vec<String>
+    pub(crate) errors: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct ResetSummary {
     pub(crate) reset: usize,
+    pub(crate) visited: usize,
     pub(crate) skipped_non_pi: usize,
     pub(crate) skipped_unsafe_status: usize,
     pub(crate) failed: usize,
-    pub(crate) errors: Vec<String>
+    pub(crate) errors: Vec<String>,
+    pub(crate) outcomes: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct ResetCandidatesSummary {
-   candidates: usize,
-   skipped_non_pi: usize,
-   skipped_unsafe_status: usize,
-   skipped_invalid_agent_data: usize,
-   skipped_missing_session: usize,
-   skipped_invalid_session: usize,
-   candidate_errors: Vec<String>
+    candidates: usize,
+    skipped_non_pi: usize,
+    skipped_unsafe_status: usize,
+    skipped_invalid_agent_data: usize,
+    skipped_missing_session: usize,
+    skipped_invalid_session: usize,
+    candidate_errors: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct ResetCandidate {
     pane_id: String,
-    session_path: String
+    session_path: String,
+    was_idle: bool,
 }
 
-pub async fn get_reset_candidates(herdr_path: &str, agent_list: &[AgentInfo]) -> (Vec<ResetCandidate>, ResetCandidatesSummary) {
+impl ResetCandidate {
+    fn matches_session(&self, agent: &AgentInfo) -> bool {
+        agent.agent == "pi"
+            && agent.agent_session.as_ref().is_some_and(|session| {
+                session.agent == "pi"
+                    && session.kind == "path"
+                    && session.value == self.session_path
+            })
+    }
+}
+
+pub async fn get_reset_candidates(
+    herdr_path: &str,
+    agent_list: &[AgentInfo],
+) -> (Vec<ResetCandidate>, ResetCandidatesSummary) {
     let mut reset_candidates_summary = ResetCandidatesSummary {
         candidates: 0,
         skipped_non_pi: 0,
@@ -50,7 +70,7 @@ pub async fn get_reset_candidates(herdr_path: &str, agent_list: &[AgentInfo]) ->
         skipped_invalid_agent_data: 0,
         skipped_missing_session: 0,
         skipped_invalid_session: 0,
-        candidate_errors: Vec::new()
+        candidate_errors: Vec::new(),
     };
 
     let mut reset_candidates: Vec<ResetCandidate> = Vec::new();
@@ -76,14 +96,13 @@ pub async fn get_reset_candidates(herdr_path: &str, agent_list: &[AgentInfo]) ->
             continue;
         }
 
-
         match is_pi_running_in_pane(herdr_path, &value.pane_id).await {
             Ok(pane_status) => {
                 if matches!(pane_status, PanePiStatus::NonPi) {
                     reset_candidates_summary.skipped_non_pi += 1;
                     continue;
                 }
-            },
+            }
             Err(error) => {
                 reset_candidates_summary.candidate_errors.push(error);
                 continue;
@@ -91,7 +110,7 @@ pub async fn get_reset_candidates(herdr_path: &str, agent_list: &[AgentInfo]) ->
         }
 
         match &value.agent_session {
-            Some(session) =>{
+            Some(session) => {
                 if &session.agent != "pi" {
                     reset_candidates_summary.skipped_invalid_session += 1;
                     continue;
@@ -102,161 +121,227 @@ pub async fn get_reset_candidates(herdr_path: &str, agent_list: &[AgentInfo]) ->
                     continue;
                 }
 
-                if session.value.is_empty() {
+                if session.value.is_empty() || session.value.chars().any(char::is_control) {
                     reset_candidates_summary.skipped_invalid_session += 1;
                     continue;
                 }
 
                 let reset_candidate = ResetCandidate {
                     pane_id: value.pane_id.clone(),
-                    session_path: session.value.clone()
+                    session_path: session.value.clone(),
+                    was_idle: value.agent_status == "idle",
                 };
 
                 reset_candidates.push(reset_candidate);
                 reset_candidates_summary.candidates += 1;
-            },
+            }
             None => {
                 reset_candidates_summary.skipped_missing_session += 1;
                 continue;
             }
         }
-
     }
 
     (reset_candidates, reset_candidates_summary)
 }
 
 async fn wait_until_pi_exits(herdr_path: &str, pane_id: &str) -> Result<(), String> {
-    let res = timeout(Duration::from_secs(15), async {
+    timeout(Duration::from_secs(15), async {
         loop {
-            let pi_running_result = is_pi_running_in_pane(herdr_path, pane_id).await;
+            // Don't paste a shell command into an unrelated foreground process, or
+            // accept stale lifecycle data from the old Pi as the resumed session.
+            if get_pane_process_info(herdr_path, pane_id).await?.is_shell()
+                && !get_agent_list(herdr_path)
+                    .await?
+                    .iter()
+                    .any(|a| a.pane_id == pane_id && a.agent == "pi")
+            {
+                return Ok(());
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("{pane_id}: shell not ready after /quit; no start command sent"))?
+}
 
-            match pi_running_result {
-                Ok(p) => {
-                    if matches!(p, PanePiStatus::RunningPi) {
-                        let sleep_time = time::Duration::from_millis(500);
-                        tokio::time::sleep(sleep_time).await;
-                    } else {
-                        return Ok(());
+async fn wait_until_pi_ready(herdr_path: &str, candidate: &ResetCandidate) -> Result<(), String> {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let agents = get_agent_list(herdr_path).await?;
+            if let Some(agent) = agents.iter().find(|a| a.pane_id == candidate.pane_id)
+                && candidate.matches_session(agent)
+                && matches!(agent.agent_status.as_str(), "idle" | "done")
+                && get_pane_process_info(herdr_path, &candidate.pane_id)
+                    .await?
+                    .is_pi()
+            {
+                return Ok(());
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "{}: resumed Pi/session not ready after 30s; not focused",
+            candidate.pane_id
+        )
+    })?
+}
+
+async fn reset_one_candidate(
+    herdr_path: &str,
+    candidate: &ResetCandidate,
+    progress: &Progress,
+    completed: usize,
+    total: usize,
+) -> Result<(), String> {
+    progress.update(completed, total, &format!("{} stopping", candidate.pane_id))?;
+    run_in_pane(herdr_path, &candidate.pane_id, "/quit").await?;
+    wait_until_pi_exits(herdr_path, &candidate.pane_id).await?;
+    progress.update(completed, total, &format!("{} starting", candidate.pane_id))?;
+    let safe_session_path = escape(std::borrow::Cow::Borrowed(&candidate.session_path));
+    run_in_pane(
+        herdr_path,
+        &candidate.pane_id,
+        &format!("pi --session {safe_session_path}"),
+    )
+    .await?;
+    progress.update(completed, total, &format!("{} waiting", candidate.pane_id))?;
+    wait_until_pi_ready(herdr_path, candidate).await
+}
+
+pub(crate) async fn reset_all_pi(
+    herdr_path: &str,
+    agents: &[AgentInfo],
+) -> Result<ResetSummary, String> {
+    let progress = Progress::start()?;
+    let (candidates, counts) = get_reset_candidates(herdr_path, agents).await;
+    let mut summary = ResetSummary {
+        reset: 0,
+        visited: 0,
+        skipped_non_pi: counts.skipped_non_pi,
+        skipped_unsafe_status: counts.skipped_unsafe_status,
+        failed: counts.skipped_invalid_agent_data
+            + counts.skipped_missing_session
+            + counts.skipped_invalid_session
+            + counts.candidate_errors.len(),
+        errors: counts.candidate_errors,
+        outcomes: Vec::new(),
+    };
+    for (count, reason) in [
+        (counts.skipped_invalid_agent_data, "invalid agent data"),
+        (counts.skipped_missing_session, "no session data"),
+        (counts.skipped_invalid_session, "invalid session data"),
+    ] {
+        if count > 0 {
+            summary
+                .errors
+                .push(format!("{count} reset candidate(s) had {reason}"));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(summary);
+    }
+    let origin = original_pane()?;
+    let total = candidates.len();
+    progress.update(0, total, "starting; don't switch panes")?;
+    // Let the one-second status-bar poll display the warning before any mutation.
+    time::sleep(Duration::from_millis(1100)).await;
+    let mut focus_attempted = false;
+    let mut processed = 0;
+    let work = async {
+        for (completed, candidate) in candidates.iter().enumerate() {
+            processed = completed + 1;
+            progress.update(completed, total, &format!("{} checking", candidate.pane_id))?;
+            // A later pane may have become busy or changed sessions while earlier panes reset.
+            let current = get_agent_list(herdr_path).await?;
+            let agent = current.iter().find(|a| a.pane_id == candidate.pane_id);
+            let Some(agent) = agent.filter(|a| a.agent == "pi") else {
+                summary.skipped_non_pi += 1;
+                summary
+                    .outcomes
+                    .push(format!("{} skipped (no longer Pi)", candidate.pane_id));
+                continue;
+            };
+            if !matches!(agent.agent_status.as_str(), "idle" | "done") {
+                summary.skipped_unsafe_status += 1;
+                summary
+                    .outcomes
+                    .push(format!("{} skipped (now busy)", candidate.pane_id));
+                continue;
+            }
+            if !candidate.matches_session(agent) {
+                summary.failed += 1;
+                summary
+                    .errors
+                    .push(format!("{} changed session; not reset", candidate.pane_id));
+                continue;
+            }
+            if !get_pane_process_info(herdr_path, &candidate.pane_id)
+                .await?
+                .is_pi()
+            {
+                summary.skipped_non_pi += 1;
+                summary
+                    .outcomes
+                    .push(format!("{} skipped (not Pi)", candidate.pane_id));
+                continue;
+            }
+            match reset_one_candidate(herdr_path, candidate, &progress, completed, total).await {
+                Ok(()) => {
+                    summary.reset += 1;
+                    summary
+                        .outcomes
+                        .push(format!("{} restarted", candidate.pane_id));
+                    if candidate.was_idle {
+                        progress.update(
+                            completed,
+                            total,
+                            &format!("{} viewing", candidate.pane_id),
+                        )?;
+                        focus_attempted = true;
+                        focus_pane(&candidate.pane_id)?;
+                        // ponytail: no public client acknowledgement receipt. Allow one
+                        // second for a focused local client to render; not a remote/unfocused guarantee.
+                        time::sleep(Duration::from_secs(1)).await;
+                        summary.visited += 1;
                     }
-
-                },
+                }
                 Err(error) => {
-                    return Err(error);
+                    summary.failed += 1;
+                    summary
+                        .errors
+                        .push(format!("{}: {error}", candidate.pane_id));
+                    summary
+                        .outcomes
+                        .push(format!("{} failed", candidate.pane_id));
                 }
             }
+            progress.update(completed + 1, total, "continuing")?;
         }
-    }).await;
-
-    match res {
-        Ok(wait_result) => wait_result,
-        Err(error) => {
-            let error_str = format!("Error, timeout reached for pane_id: {} - error: {}", pane_id, error);
-            Err(error_str)
-        },
+        Ok::<(), String>(())
     }
-}
-
-pub async fn reset_one_candidate(herdr_path: &str, candidate: &ResetCandidate) -> Result<(), String> {
-
-    let quit_result = run_in_pane(herdr_path, candidate.pane_id.as_str(), "/quit").await;
-
-    match quit_result {
-        Ok(_) => (),
-        Err(error) => {
-            let error_str = format!("Error with resetting pane: {} - error: {}", candidate.pane_id, error);
-            return Err(error_str);
-        }
+    .await;
+    if let Err(error) = work {
+        summary.failed += 1;
+        summary.errors.push(error);
     }
-
-    let wait_result = wait_until_pi_exits(herdr_path, &candidate.pane_id).await;
-
-    match wait_result {
-        Ok(_) => (),
-        Err(error) => {
-            let error_str = format!("Error with exiting pi on pane: {} - error: {}", candidate.pane_id, error);
-            return Err(error_str);
+    // Restore even after a failed/ambiguous focus or a later reset error. Never pick
+    // some other pane if the original disappeared; report that restoration failed.
+    if focus_attempted {
+        let _ = progress.update(processed, total, "returning to original pane");
+        if let Err(error) = focus_pane(&origin) {
+            summary.failed += 1;
+            summary
+                .errors
+                .push(format!("Could not restore original pane {origin}: {error}"));
+        } else {
+            time::sleep(Duration::from_secs(1)).await;
         }
     }
-
-    let safe_session_path = escape(std::borrow::Cow::Borrowed(&candidate.session_path));
-    let start_command = format!("pi --session {}", safe_session_path);
-
-    let start_result = run_in_pane(herdr_path, candidate.pane_id.as_str(), &start_command).await;
-
-    match start_result {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let error_str = format!("Error with starting pi on pane: {} - error: {}", candidate.pane_id, error);
-            Err(error_str)
-        }
-    }
-}
-
-pub(crate) async fn reset_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ResetSummary {
-    let (candidates, candidates_summary) = get_reset_candidates(herdr_path, agents).await;
-
-    let mut reset_summary = ResetSummary {
-        reset: 0,
-        skipped_non_pi: candidates_summary.skipped_non_pi,
-        skipped_unsafe_status: candidates_summary.skipped_unsafe_status,
-        failed: candidates_summary.skipped_invalid_agent_data + candidates_summary.skipped_missing_session + candidates_summary.skipped_invalid_session,
-        errors: Vec::new()
-    };
-
-    if candidates_summary.skipped_invalid_agent_data > 0 {
-        reset_summary.errors.push(format!(
-            "{} reset candidate(s) had invalid agent data",
-            candidates_summary.skipped_invalid_agent_data
-        ));
-    }
-
-    if candidates_summary.skipped_missing_session > 0 {
-        reset_summary.errors.push(format!(
-            "{} reset candidate(s) had no session data",
-            candidates_summary.skipped_missing_session
-        ));
-    }
-
-    if candidates_summary.skipped_invalid_session > 0 {
-        reset_summary.errors.push(format!(
-            "{} reset candidate(s) had invalid session data",
-            candidates_summary.skipped_invalid_session
-        ));
-    }
-
-    if !candidates_summary.candidate_errors.is_empty() {
-        reset_summary.failed += candidates_summary.candidate_errors.len();
-        reset_summary.errors.extend(candidates_summary.candidate_errors);
-    }
-
-    let reset_tasks: Vec<JoinHandle<Result<(), String>>> = candidates.into_iter().map(|candidate| {
-        let herdr_path_c = herdr_path.to_string();
-        tokio::spawn(async move {
-            let res = reset_one_candidate(&herdr_path_c, &candidate).await;
-            return res;
-        })
-    }).collect();
-
-    for task in reset_tasks {
-        let task_res = task.await;
-        match task_res {
-            Ok(res) => match res {
-                Ok(_) => reset_summary.reset += 1,
-                Err(error) => {
-                    reset_summary.failed += 1;
-                    reset_summary.errors.push(error);
-                },
-            },
-            Err(join_error) => {
-                let error_str = format!("Join error: {}", join_error);
-                reset_summary.failed += 1;
-                reset_summary.errors.push(error_str);
-            },
-        }
-    }
-
-    return reset_summary;
+    Ok(summary)
 }
 
 pub async fn reload_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ReloadSummary {
@@ -266,11 +351,10 @@ pub async fn reload_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ReloadSumm
         skipped_unsafe_status: 0,
         skipped_invalid_agent_data: 0,
         failed: 0,
-        errors: Vec::new()
+        errors: Vec::new(),
     };
 
-    for (_index, agent) in agents.iter().enumerate() {
-
+    for agent in agents {
         let pane_id = agent.pane_id.as_str();
         let agent_name = agent.agent.as_str();
         let agent_status = agent.agent_status.as_str();
@@ -280,16 +364,15 @@ pub async fn reload_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ReloadSumm
             continue;
         }
 
-        let required_fields = [
-            ("pane_id", pane_id),
-            ("agent_status", agent_status),
-        ];
+        let required_fields = [("pane_id", pane_id), ("agent_status", agent_status)];
 
         let mut invalid_agent_data = false;
         for (name, value) in required_fields {
             if value.is_empty() {
                 invalid_agent_data = true;
-                reload_summary.errors.push(format!("Pi agent is missing {}", name));
+                reload_summary
+                    .errors
+                    .push(format!("Pi agent is missing {}", name));
             }
         }
 
@@ -304,13 +387,12 @@ pub async fn reload_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ReloadSumm
                     reload_summary.skipped_non_pi += 1;
                     continue;
                 }
-            },
+            }
             Err(error) => {
                 reload_summary.failed += 1;
                 reload_summary.errors.push(error);
                 continue;
             }
-
         }
 
         if agent_status == "done" || agent_status == "idle" {
@@ -329,5 +411,5 @@ pub async fn reload_all_pi(herdr_path: &str, agents: &[AgentInfo]) -> ReloadSumm
         }
     }
 
-    return reload_summary;
+    reload_summary
 }

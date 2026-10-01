@@ -1,9 +1,10 @@
 mod herdr;
 mod pi;
+mod progress;
 mod render;
 mod tui;
 
-use std::{env};
+use std::env;
 
 use crate::herdr::get_agent_list;
 use crate::pi::{reload_all_pi, reset_all_pi};
@@ -14,11 +15,19 @@ async fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.is_empty() {
-        println!("Usage: cargo run -- reload / reset / tui");
+        println!("Usage: herdr-pi-reloader reload / reset / tui / status");
         return;
     }
 
     let command = &args[0];
+
+    if command == "status" {
+        let status = progress::status_line();
+        if !status.is_empty() {
+            println!("{status} · ");
+        }
+        return;
+    }
 
     if command != "reload" && command != "reset" && command != "tui" {
         println!("Error: Unknown command");
@@ -60,8 +69,13 @@ async fn main() {
     }
 
     if command == "reset" {
-        let reset_summary = reset_all_pi(&herdr_path, &agents).await;
-        println!("{:#?}", reset_summary);
+        match reset_all_pi(&herdr_path, &agents).await {
+            Ok(summary) => println!("{summary:#?}"),
+            Err(error) => {
+                eprintln!("Reset not started: {error}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 }

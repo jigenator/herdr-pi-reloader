@@ -9,7 +9,8 @@ use tokio::task::JoinHandle;
 use crate::herdr::get_agent_list;
 use crate::pi::{ReloadSummary, ResetSummary, reload_all_pi, reset_all_pi};
 use crate::render::{
-    render_error, render_menu, render_reload_result, render_reset_result, render_running_reload, render_running_reset,
+    render_error, render_menu, render_reload_result, render_reset_result, render_running_reload,
+    render_running_reset,
 };
 
 pub async fn run() -> io::Result<()> {
@@ -79,85 +80,82 @@ async fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
 
         terminal.draw(|frame| render(frame, &state))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    if !matches!(state.screen, Screen::RunningReset) {
-                        match key.code {
-                            Char('q') | Esc => break Ok(()),
-                            Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
-                            _ => {}
-                        }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            if !matches!(state.screen, Screen::RunningReset) {
+                match key.code {
+                    Char('q') | Esc => break Ok(()),
+                    Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break Ok(());
                     }
+                    _ => {}
+                }
+            }
 
-                    match &state.screen {
-                        Screen::Menu => match key.code {
-                            Char('j') | Down => state.selected = 1,
-                            Char('k') | Up => state.selected = 0,
-                            Enter => {
-                                if state.selected == 0 {
-                                    state.screen = Screen::RunningReload;
-                                    terminal.draw(|frame| render(frame, &state))?;
+            match &state.screen {
+                Screen::Menu => match key.code {
+                    Char('j') | Down => state.selected = 1,
+                    Char('k') | Up => state.selected = 0,
+                    Enter => {
+                        if state.selected == 0 {
+                            state.screen = Screen::RunningReload;
+                            terminal.draw(|frame| render(frame, &state))?;
 
+                            let herdr_path_result = env::var("HERDR_BIN_PATH");
+
+                            let herdr_path = match herdr_path_result {
+                                Ok(path) => path,
+                                Err(_error) => String::from("herdr"),
+                            };
+
+                            match get_agent_list(&herdr_path).await {
+                                Ok(agents) => {
+                                    let reload_summary = reload_all_pi(&herdr_path, &agents).await;
+
+                                    state.screen = Screen::ReloadResult(reload_summary);
+                                }
+                                Err(error) => {
+                                    state.screen = Screen::Error(format!(
+                                        "Failed to get agent list: {}",
+                                        error
+                                    ));
+                                }
+                            };
+                        } else {
+                            state.screen = Screen::RunningReset;
+                            state.spinner_frame = 0;
+
+                            let handler: JoinHandle<Result<ResetSummary, String>> =
+                                tokio::spawn(async {
                                     let herdr_path_result = env::var("HERDR_BIN_PATH");
-
                                     let herdr_path = match herdr_path_result {
                                         Ok(path) => path,
                                         Err(_error) => String::from("herdr"),
                                     };
 
-                                    match get_agent_list(&herdr_path).await {
-                                        Ok(agents) => {
-                                            let reload_summary =
-                                                reload_all_pi(&herdr_path, &agents).await;
-
-                                            state.screen = Screen::ReloadResult(reload_summary);
-                                        }
+                                    let agents = match get_agent_list(&herdr_path).await {
+                                        Ok(value) => value,
                                         Err(error) => {
-                                            state.screen = Screen::Error(format!(
-                                                "Failed to get agent list: {}",
-                                                error
-                                            ));
+                                            return Err(error);
                                         }
                                     };
-                                } else {
-                                    state.screen = Screen::RunningReset;
-                                    state.spinner_frame = 0;
 
-                                    let handler: JoinHandle<Result<ResetSummary, String>> =
-                                        tokio::spawn(async {
+                                    reset_all_pi(&herdr_path, &agents).await
+                                });
 
-                                            let herdr_path_result = env::var("HERDR_BIN_PATH");
-                                            let herdr_path = match herdr_path_result {
-                                                Ok(path) => path,
-                                                Err(_error) => String::from("herdr"),
-                                            };
-
-                                            let agents = match get_agent_list(&herdr_path).await {
-                                                Ok(value) => value,
-                                                Err(error) => {
-                                                    return Err(error);
-                                                }
-                                            };
-
-                                            let result = reset_all_pi(&herdr_path, &agents).await;
-                                            Ok(result)
-                                        });
-
-                                    state.reset_task = Some(handler);
-                                }
-                            }
-                            _ => {}
-                        },
-                        Screen::ReloadResult(_) | Screen::Error(_) | Screen::ResetResult(_) => match key.code {
-                            Enter => {
-                                break Ok(());
-                            }
-                            _ => {}
-                        },
-                        Screen::RunningReload | Screen::RunningReset => {}
+                            state.reset_task = Some(handler);
+                        }
+                    }
+                    _ => {}
+                },
+                Screen::ReloadResult(_) | Screen::Error(_) | Screen::ResetResult(_) => {
+                    if key.code == Enter {
+                        break Ok(());
                     }
                 }
+                Screen::RunningReload | Screen::RunningReset => {}
             }
         }
     }
@@ -175,7 +173,9 @@ fn render(frame: &mut Frame, state: &AppState) {
         Screen::RunningReload => render_running_reload(frame, main_area, footer_area),
         Screen::ReloadResult(result) => render_reload_result(frame, main_area, footer_area, result),
         Screen::Error(error) => render_error(frame, main_area, footer_area, error),
-        Screen::RunningReset => render_running_reset(frame, main_area, footer_area, &state.spinner_frame),
+        Screen::RunningReset => {
+            render_running_reset(frame, main_area, footer_area, &state.spinner_frame)
+        }
         Screen::ResetResult(result) => render_reset_result(frame, main_area, footer_area, result),
     }
 }

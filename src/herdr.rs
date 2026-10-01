@@ -1,6 +1,13 @@
-use std::path::Path;
+use std::{
+    env,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::UnixStream,
+    path::Path,
+    time::Duration,
+};
 
-use serde::{Deserialize};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 #[derive(Deserialize)]
 pub(crate) struct AgentSession {
@@ -9,7 +16,7 @@ pub(crate) struct AgentSession {
     #[serde(default)]
     pub(crate) kind: String,
     #[serde(default)]
-    pub(crate) value: String
+    pub(crate) value: String,
 }
 
 #[derive(Deserialize)]
@@ -20,159 +27,171 @@ pub struct AgentInfo {
     pub(crate) agent_status: String,
     #[serde(default)]
     pub(crate) pane_id: String,
-    pub(crate) agent_session: Option<AgentSession>
+    pub(crate) agent_session: Option<AgentSession>,
 }
 
 #[derive(Deserialize)]
-struct AgentListResult {
-    agents: Vec<AgentInfo>
-}
-
-#[derive(Deserialize)]
-struct AgentListResponse {
-    result: AgentListResult
-}
-
-#[derive(Deserialize)]
-struct ProcessInfoResponse {
-    result: ProcessInfoResult
-}
-
-#[derive(Deserialize)]
-struct ProcessInfoResult {
-    process_info: ProcessInfo
-}
-
-#[derive(Deserialize)]
-struct ProcessInfo {
-    foreground_processes: Vec<ForegroundProcess>
+pub(crate) struct ProcessInfo {
+    shell_pid: Option<u32>,
+    #[serde(default)]
+    foreground_processes: Vec<ForegroundProcess>,
 }
 
 #[derive(Deserialize)]
 struct ForegroundProcess {
+    pid: Option<u32>,
     #[serde(default)]
     name: String,
-    #[serde(default)]
     argv0: Option<String>,
-    #[serde(default)]
-    argv: Vec<String>
+    argv: Option<Vec<String>>,
 }
 
-pub async fn run_in_pane(herdr_path: &str, pane_id: &str, command: &str) -> Result<(), String> {
-    match tokio::process::Command::new(herdr_path).args(["pane", "run", pane_id, command]).output().await {
-        Ok(output) => {
-            if output.status.success() {
-                Ok(())
-            } else {
-                let std_error = String::from_utf8_lossy(&output.stderr);
-                let std_out = String::from_utf8_lossy(&output.stdout);
-
-                let error_message = format!("std_err: {std_error} - std_out: {std_out}");
-                let error_str = format!("Error in executing command: {}: on pane: {} - error: {}", command, pane_id, error_message);
-                Err(error_str)
-            }
-        },
-        Err(error) => {
-            let error_str = format!("Error in executing command: {}: on pane: {} - error: {}", command, pane_id, error);
-            Err(error_str)
-        }
+impl ProcessInfo {
+    pub(crate) fn is_pi(&self) -> bool {
+        self.foreground_processes.iter().any(|p| {
+            p.name == "pi"
+                || p.argv0
+                    .as_ref()
+                    .or_else(|| p.argv.as_ref().and_then(|args| args.first()))
+                    .and_then(|arg| Path::new(arg).file_name())
+                    .is_some_and(|name| name == "pi")
+        })
     }
 
+    pub(crate) fn is_shell(&self) -> bool {
+        !self.is_pi()
+            && self.shell_pid.is_some()
+            && self.foreground_processes.len() == 1
+            && self.foreground_processes[0].pid == self.shell_pid
+    }
+}
+
+async fn command(herdr_path: &str, args: &[&str]) -> Result<Value, String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(herdr_path)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("Herdr {args:?} timed out; command may have been delivered"))?
+    .map_err(|error| format!("Herdr {args:?}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Herdr {args:?}: {} {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        ));
+    }
+    // Mutating CLI commands such as `pane run` succeed without printing JSON.
+    if output.stdout.is_empty() {
+        return Ok(Value::Null);
+    }
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Invalid Herdr JSON: {error}"))?;
+    response_result(response)
+}
+
+fn response_result(response: Value) -> Result<Value, String> {
+    if let Some(error) = response.get("error") {
+        return Err(format!("Herdr: {error}"));
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "Herdr response has no result".into())
+}
+
+pub(crate) fn socket_path() -> Result<String, String> {
+    env::var("HERDR_SOCKET_PATH")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "Reset/status requires HERDR_SOCKET_PATH; run from Herdr".into())
+}
+
+// `agent focus` does not switch native clients in Herdr 0.9. Use the public pane API.
+pub(crate) fn api(method: &str, params: Value) -> Result<Value, String> {
+    let call = || -> Result<Value, Box<dyn std::error::Error>> {
+        let mut stream = UnixStream::connect(socket_path()?)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        writeln!(
+            stream,
+            "{}",
+            json!({"id": "pi-reloader", "method": method, "params": params})
+        )?;
+        let mut line = String::new();
+        BufReader::new(stream.take(1024 * 1024)).read_line(&mut line)?;
+        Ok(serde_json::from_str(&line)?)
+    };
+    response_result(call().map_err(|error| format!("{method}: {error}"))?)
+}
+
+pub(crate) fn original_pane() -> Result<String, String> {
+    let caller = if let Ok(context) = env::var("HERDR_PLUGIN_CONTEXT_JSON") {
+        let context: Value = serde_json::from_str(&context).map_err(|error| error.to_string())?;
+        Some(
+            context["focused_pane_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or("Plugin context has no original pane")?
+                .to_string(),
+        )
+    } else {
+        env::var("HERDR_PANE_ID").ok()
+    };
+    let result = api("pane.current", json!({"caller_pane_id": caller}))?;
+    result["pane"]["pane_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Cannot determine original pane; refusing reset".into())
+}
+
+pub(crate) fn focus_pane(pane_id: &str) -> Result<(), String> {
+    let result = api("pane.focus", json!({"pane_id": pane_id}))?;
+    if result["pane"]["pane_id"] != pane_id {
+        return Err(format!("Focus response did not confirm pane {pane_id}"));
+    }
+    Ok(())
+}
+
+pub async fn run_in_pane(herdr_path: &str, pane_id: &str, text: &str) -> Result<(), String> {
+    command(herdr_path, &["pane", "run", pane_id, text])
+        .await
+        .map(|_| ())
 }
 
 pub async fn get_agent_list(herdr_path: &str) -> Result<Vec<AgentInfo>, String> {
-    match tokio::process::Command::new(herdr_path).args(["agent", "list"]).output().await {
-        Ok(output) => {
-            if output.status.success() {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-
-                let json_result: Result<AgentListResponse, serde_json::Error> =
-                    serde_json::from_str(&output_str);
-
-                match json_result {
-                    Ok(value) => {
-                        let agents = value.result.agents;
-                        Ok(agents)
-                    },
-                    Err(error) => {
-                        let error_text = format!("Error with parsing agents json: {}", error);
-                        Err(error_text)
-                    }
-                }
-            } else {
-                let error_str = String::from_utf8_lossy(&output.stderr).to_string();
-                let error_text = format!("Herdr agent list output error: {}", error_str);
-                Err(error_text)
-            }
-
-        },
-        Err(error) => {
-            let error_str = error.to_string();
-            let error_text = format!("Failed to run herdr agent list: {}", error_str);
-            Err(error_text)
-        }
-    }
+    let result = command(herdr_path, &["agent", "list"]).await?;
+    serde_json::from_value(result["agents"].clone())
+        .map_err(|error| format!("Invalid agent list: {error}"))
 }
 
-async fn get_pane_process_info(herdr_path: &str, pane_id: &str) -> Result<Vec<ForegroundProcess>, String> {
-    match tokio::process::Command::new(herdr_path).args(["pane", "process-info", "--pane", pane_id]).output().await {
-        Ok(output) => {
-            if output.status.success() {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-
-                let json_result: Result<ProcessInfoResponse, serde_json::Error>  = serde_json::from_str(&output_str);
-
-                match json_result {
-                    Ok(value) => {
-                        let process_info = value.result.process_info.foreground_processes;
-                        Ok(process_info)
-                    },
-                    Err(error) => {
-                        let error_text = format!("Error with parsing processes json: {}", error);
-                        Err(error_text)
-                    }
-                }
-            } else {
-                let error_str = String::from_utf8_lossy(&output.stderr).to_string();
-                let error_text = format!("Herdr process output error: {}", error_str);
-                Err(error_text)
-            }
-
-        },
-        Err(error) => {
-            let error_str = error.to_string();
-            let error_text = format!("Failed to run herdr pane process info: {}", error_str);
-            Err(error_text)
-        }
-    }
+pub(crate) async fn get_pane_process_info(
+    herdr_path: &str,
+    pane_id: &str,
+) -> Result<ProcessInfo, String> {
+    let result = command(herdr_path, &["pane", "process-info", "--pane", pane_id]).await?;
+    serde_json::from_value(result["process_info"].clone())
+        .map_err(|error| format!("Invalid process info: {error}"))
 }
 
 pub(crate) enum PanePiStatus {
     RunningPi,
-    NonPi
+    NonPi,
 }
 
-pub async fn is_pi_running_in_pane(herdr_path: &str, pane_id: &str) -> Result<PanePiStatus, String> {
-    match get_pane_process_info(herdr_path, pane_id).await {
-        Ok(process_info) => {
-            for p in process_info {
-                if p.name == "pi" {
-                    return Ok(PanePiStatus::RunningPi);
-                }
-                if p.argv0
-                    .as_ref()
-                    .or_else(|| p.argv.first())
-                    .and_then(|arg| Path::new(arg).file_name())
-                    .is_some_and(|name| name == "pi")
-                {
-                    return Ok(PanePiStatus::RunningPi);
-                }
-            }
-            Ok(PanePiStatus::NonPi)
+pub async fn is_pi_running_in_pane(
+    herdr_path: &str,
+    pane_id: &str,
+) -> Result<PanePiStatus, String> {
+    Ok(
+        if get_pane_process_info(herdr_path, pane_id).await?.is_pi() {
+            PanePiStatus::RunningPi
+        } else {
+            PanePiStatus::NonPi
         },
-        Err(error) => {
-            let error_str = format!("Failed to check if pi is running in pane_id: {}, error: {}",pane_id, error);
-            Err(error_str)
-        }
-    }
+    )
 }

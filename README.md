@@ -14,15 +14,16 @@ skips instead of misleading zero counts. The plugin and action IDs are unchanged
 ## Features
 
 - **Reload all Pi** sends `/reload` to every eligible Pi pane.
-- **Reset all Pi** exits each eligible Pi process and resumes its recorded session with `pi --session`.
-- Provides a session-modal popup TUI with a summary of completed, skipped, and failed operations.
+- **Reset all Pi** restarts eligible panes **one at a time**, waits for each recorded session to become ready, and briefly visits panes that were previously reported `idle` to acknowledge startup badges.
+- Shows reset progress in Herdr's top-right bar, then returns to the original pane/popup with completed, skipped, and failed counts.
+- Rechecks each pane before quitting; busy, non-Pi, and changed sessions are not reset. Concurrent resets on the same server are rejected.
 
 ## Requirements
 
-- Herdr 0.7.4 or newer
+- Herdr 0.9.0 or newer
 - The [Pi coding agent](https://github.com/badlogic/pi-mono) available on `PATH`
 - The Herdr Pi integration
-- Rust 1.85 or newer with Cargo (required to build the plugin during installation)
+- Rust 1.89 or newer with Cargo (required to build the plugin during installation)
 - Linux or macOS
 
 ## Installation
@@ -70,10 +71,53 @@ Inside the popup:
 - `q`, `Esc`, or `Ctrl+C` — close (disabled while a reset is running)
 
 With [Herdr Spotlight](https://github.com/jigenator/herdr-spotlight), search for
-**Open Pi Reloader**. No separate reset/reloader shortcut or plugin configuration is needed.
+**Open Pi Reloader**. No separate reset/reloader shortcut is needed.
+
+### Reset progress bar — configure before using Reset
+
+Add a command entry to your existing `[ui].tab_bar_right` array in Herdr's
+`config.toml`, preserving the other entries:
+
+```toml
+{ type = "command", command = "\"/absolute/plugin/root/target/release/herdr-pi-reloader\" status", interval_seconds = 1, timeout_seconds = 1 },
+```
+
+Replace `/absolute/plugin/root` with `plugin_root` from
+`herdr plugin list --plugin herdr-pi-reloader.pi-reloader --json`, then run
+`herdr server reload-config`. This reloads Herdr configuration, not Pi sessions.
+The installed path stays stable across plugin upgrades.
+
+During reset the bar shows, for example:
+
+```text
+DON'T TYPE | Pi [####----] 2/4 w3:p1 waiting
+```
+
+The indicator disappears on completion. `status` only reads local progress; it
+never queries, focuses, or resets panes. Progress and an OS reset lock live next
+to the active `HERDR_SOCKET_PATH`, independently for each server. A crashed reset
+cannot leave a permanently active indicator or lock. The original pane is
+restored on normal completion and handled errors; forced process termination
+cannot guarantee restoration.
+
+**Do not type, click, switch panes, or leave the Herdr window until the summary
+returns.** The popup belongs to its original tab and disappears while visiting
+other tabs; **it does not block input there**. Herdr's public pane-focus API moves
+all attached clients on the same server, so use this with one active client/view.
+Visiting a split tab also acknowledges other visible panes in that tab. Previously
+`done` reset candidates are not deliberately visited, but exact per-client
+acknowledgement preservation is not possible through Herdr's API.
+
+A visit waits one second for a focused local client to render. Herdr has no public
+client acknowledgement receipt: `Visited` means focus succeeded, not a verified
+badge change in every client. Unfocused or slow remote clients may still show
+`done`. Restart success requires the original session path, an idle/done report,
+and a foreground Pi process—not just successful command submission.
 
 **Live testing is manual.** Reset affects every eligible Pi session, including an
 assistant's own idle session. Finish automated work before testing from the popup.
+The CLI `reset` entrypoint also moves focus and requires `HERDR_SOCKET_PATH`;
+`reload` retains its existing behavior.
 
 ## Updating
 
@@ -125,7 +169,21 @@ python3 -m unittest discover -s tests -v
 
 The Python checks use a fake Herdr executable and isolated environment. Reload/reset
 commands are recorded, never executed against live panes. They cover current and legacy
-process identity, non-Pi rejection, busy/session guards, process errors, and quoted session resume.
+process identity, non-Pi rejection, refreshed busy/session guards, process errors,
+quoted session resume, shell/startup readiness, focus restoration, progress isolation,
+and crash-safe locking.
+
+An opt-in integration test starts a real Herdr server and native TUI in a private
+PTY with a temporary HOME/socket and a fake `pi` executable first on PATH:
+
+```sh
+HERDR_RELOADER_ISOLATED=1 python3 -m unittest discover -s tests -p test_isolated_herdr.py -v
+```
+
+It checks sequential restarts, session preservation, busy skips, visible progress,
+client idle badges, and return to the original popup. It requires Node and Bash;
+no real Pi sessions are started or reset. Logs/screens remain in the printed
+`/tmp/pir-ui-*` evidence directory. `RELOADER_BINARY` selects another build.
 
 ## Contributing
 
