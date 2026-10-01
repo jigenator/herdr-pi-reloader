@@ -155,10 +155,12 @@ class PiGuardTests(unittest.TestCase):
         until = time.monotonic() + timeout
         while time.monotonic() < until:
             self.pump()
+            # Snapshot first: exit between two polls must not become a false failure.
+            exited = self.process.poll() is not None
             try:
                 if predicate(): return
             except (FileNotFoundError, json.JSONDecodeError, ConnectionRefusedError): pass
-            if self.process.poll() is not None: break
+            if exited: break
         self.fail(f'Isolated Pi condition timed out; {self.root}; output:\n{self.output[-5000:].decode(errors="replace")}')
 
     def state(self):
